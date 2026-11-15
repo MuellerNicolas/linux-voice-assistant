@@ -2,23 +2,16 @@
 """
 ReSpeaker 4-Mic Array HAT – Linux Voice Assistant peripheral controller.
 
-Mirrors the Home Assistant Voice PE LED ring animations and maps four
-external GPIO buttons to LVA peripheral API commands.
+Mirrors the Home Assistant Voice PE LED ring animations.
 
 Hardware layout (ReSpeaker 4-Mic HAT on Raspberry Pi)
 ------------------------------------------------------
   LED ring   : 12 × APA102 RGB LEDs  →  SPI0 (MOSI GPIO 10, SCLK GPIO 11)
   Microphones: 4 × MEMS mics         →  I2S (AC108 codec, seeed-voicecard driver)
 
-The ReSpeaker 4-Mic HAT has no onboard buttons. Connect your own momentary
-tactile switches between the GPIO pins above and GND.
-
 Install dependencies
 ---------------------
-  pip install websockets apa102-pi gpiozero lgpio
-
-Note: gpiozero with the lgpio backend works on Pi 3/4/5 without RPi.GPIO.
-  Requires /dev/gpiochip0 (Pi 1–4) or /dev/gpiochip4 (Pi 5).
+  pip install websockets spidev gpiod
 
 Enable SPI on the Pi (required for APA102 LEDs):
   Add  dtparam=spi=on  to /boot/firmware/config.txt and reboot.
@@ -35,7 +28,6 @@ import argparse
 import asyncio
 import json
 import logging
-import math
 import random
 import signal
 import sys
@@ -44,23 +36,9 @@ import time
 from enum import Enum
 from typing import Optional, Tuple
 
-# ---------------------------------------------------------------------------
-# Hardware dependencies — gracefully stubbed when not on real Pi hardware
-# ---------------------------------------------------------------------------
-
-try:
-    from gpiozero import Button as GPIOButton  # type: ignore[import]
-    _HAS_GPIO = True
-except ImportError:
-    _HAS_GPIO = False
-    logging.warning("gpiozero not found – button input disabled")
-
-try:
-    from apa102_pi.driver import apa102 as _apa102_driver  # type: ignore[import]
-    _HAS_APA102 = True
-except ImportError:
-    _HAS_APA102 = False
-    logging.warning("apa102-pi not found – LED output disabled")
+import gpiod
+import spidev
+from gpiod.line import Direction, Value
 
 try:
     import websockets  # type: ignore[import]
@@ -82,13 +60,16 @@ LIGHT_NAME      = "LED Ring"
 LIGHT_ICON      = "mdi:circle-outline"
 EFFECT_VOICE_ASSISTANT = "Voice Assistant"
 
-BTN_DEBOUNCE_MS = 150  # Button debounce in milliseconds
-
 # APA102 LED ring
 LED_COUNT      = 12
-# SPI bus and device (SPI0, CE1 — CE0 is also valid if CE1 conflicts)
+# SPI bus and device (SPI0, CE1)
 SPI_BUS        = 0
 SPI_DEVICE     = 1
+GPIO_CHIP      = "/dev/gpiochip0"
+LED_POWER_GPIO = 5
+SPI_SPEED_HZ   = 8_000_000
+# LED index at the center of the timer arc; LED 0 is the default top position.
+TIMER_ARC_CENTER_LED = 9
 # Global brightness: 0–31. APA102 has a separate 5-bit brightness register.
 # 10 ≈ 32 % (gentle default), 31 = maximum.
 LED_BRIGHTNESS = 10
@@ -137,7 +118,6 @@ class AssistState(str, Enum):
     TTS_FINISHED  = "tts_finished"
     ERROR         = "error"
     MUTED         = "muted"
-    TIMER_TICKING = "timer_ticking"
     TIMER_RINGING = "timer_ringing"
     MEDIA_PLAYING = "media_player_playing"
     VOLUME_MUTED  = "volume_muted"
@@ -161,6 +141,7 @@ class SharedState:
         self.volume_muted: bool = False   # media player (speaker) mute
         self.timer_total_seconds: int = 0
         self.timer_seconds_left: int = 0
+        self.timer_updated_at: float = 0.0
         # Light entity state, driven by HA via light_command events.
         # Defaults match the LEDLightEntity in LVA core so the script
         # behaves sensibly before the first light_command arrives: off by
@@ -188,6 +169,7 @@ class SharedState:
                 "volume_muted":        self.volume_muted,
                 "timer_total_seconds": self.timer_total_seconds,
                 "timer_seconds_left":  self.timer_seconds_left,
+                "timer_updated_at":    self.timer_updated_at,
                 "light_is_on":         self.light_is_on,
                 "light_brightness":    self.light_brightness,
                 "light_red":           self.light_red,
@@ -214,9 +196,50 @@ def _scale(color: RGB, factor: float) -> RGB:
     return (int(color[0] * f), int(color[1] * f), int(color[2] * f))
 
 
+def _remaining_timer_seconds(
+    seconds_left: float, updated_at: float, now: Optional[float] = None
+) -> float:
+    if updated_at <= 0:
+        return max(0.0, seconds_left)
+    elapsed = max(0.0, (time.monotonic() if now is None else now) - updated_at)
+    return max(0.0, seconds_left - elapsed)
+
+
+def _timer_arc_brightness(index: int, center: int, arc_length: float) -> float:
+    if arc_length <= 0:
+        return 0.0
+    if arc_length >= LED_COUNT:
+        return 1.0
+
+    center %= LED_COUNT
+    distance = (
+        (index - center + LED_COUNT / 2) % LED_COUNT
+    ) - LED_COUNT / 2
+    half_length = arc_length / 2
+    cell_start = distance - 0.5
+    cell_end = distance + 0.5
+    brightness = 0.0
+    for shift in (-LED_COUNT, 0, LED_COUNT):
+        brightness += max(
+            0.0,
+            min(cell_end, half_length + shift)
+            - max(cell_start, -half_length + shift),
+        )
+    return min(1.0, brightness)
+
+
+def _encode_apa102_frame(pixels: list[RGB], brightness: int) -> list[int]:
+    frame = [0, 0, 0, 0]
+    led_header = 0xE0 | (brightness & 0x1F)
+    for red, green, blue in pixels:
+        frame.extend((led_header, blue, green, red))
+    frame.extend([0] * ((len(pixels) + 15) // 16))
+    return frame
+
+
 class LEDRing:
     """
-    Manages the 12-LED APA102 ring via the apa102-pi SPI driver.
+    Manages the 12-LED APA102 ring directly through spidev.
 
     All animations run in a dedicated daemon thread. Calling
     ``set_animation()`` switches cleanly to the new pattern.
@@ -238,7 +261,20 @@ class LEDRing:
     def __init__(self, state: SharedState) -> None:
         self._state = state
         self._pixels: list[RGB] = [BLACK] * LED_COUNT
-        self._strip = None
+        self._spi = spidev.SpiDev()
+        self._gpio_request = gpiod.request_lines(
+            GPIO_CHIP,
+            consumer="respeaker4mic-led-power",
+            config={
+                LED_POWER_GPIO: gpiod.LineSettings(
+                    direction=Direction.OUTPUT,
+                    output_value=Value.ACTIVE,
+                )
+            },
+        )
+        self._spi.open(SPI_BUS, SPI_DEVICE)
+        self._spi.max_speed_hz = SPI_SPEED_HZ
+        self._spi.mode = 0
         self._animation = self.ANIM_OFF
         self._anim_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -251,18 +287,10 @@ class LEDRing:
         self._brightness_dec: bool = True
         self._twinkle_state: list[float] = [0.0] * LED_COUNT
 
-        if _HAS_APA102:
-            self._strip = _apa102_driver.APA102(
-                num_led=LED_COUNT,
-                global_brightness=LED_BRIGHTNESS,
-                mosi=10,
-                sclk=11,
-                ce=SPI_DEVICE,
-            )
-            _LOGGER.info(
-                "APA102 LED ring initialised (%d LEDs, SPI0 CE%d)",
-                LED_COUNT, SPI_DEVICE,
-            )
+        _LOGGER.info(
+            "APA102 LED ring initialised (%d LEDs, SPI%d device %d)",
+            LED_COUNT, SPI_BUS, SPI_DEVICE,
+        )
 
     def start(self) -> None:
         self._thread.start()
@@ -271,8 +299,8 @@ class LEDRing:
         self._stop_event.set()
         self._thread.join(timeout=2)
         self._all_off()
-        if _HAS_APA102 and self._strip is not None:
-            self._strip.cleanup()
+        self._spi.close()
+        self._gpio_request.release()
 
     def set_animation(self, name: str) -> None:
         with self._anim_lock:
@@ -289,11 +317,7 @@ class LEDRing:
     # ------------------------------------------------------------------
 
     def _write(self) -> None:
-        if not _HAS_APA102 or self._strip is None:
-            return
-        for i, (r, g, b) in enumerate(self._pixels):
-            self._strip.set_pixel(i, r, g, b)
-        self._strip.show()
+        self._spi.xfer2(_encode_apa102_frame(self._pixels, LED_BRIGHTNESS))
 
     def _all_off(self) -> None:
         self._pixels = [BLACK] * LED_COUNT
@@ -463,25 +487,24 @@ class LEDRing:
 
     def _anim_timer_tick(
         self, color: RGB, muted: bool,
-        seconds_left: int, total_seconds: int,
+        seconds_left: float, total_seconds: int,
     ) -> float:
         """
-        Arc proportional to remaining time with sweep marker dip.
+        Arc proportional to remaining time, centered on TIMER_ARC_CENTER_LED.
         Mirrors ESPHome "Timer Tick" effect exactly.
         """
-        total = max(total_seconds, 1)
-        timer_ratio = LED_COUNT * seconds_left / total
-        last_led_on = max(0, math.ceil(timer_ratio) - 1)
+        if total_seconds <= 0:
+            self._all_off()
+            return 0.1
+        timer_ratio = LED_COUNT * max(0.0, min(seconds_left / total_seconds, 1.0))
 
         for i in range(LED_COUNT):
-            brightness_dip = (
-                0.9 if (i == self._index % LED_COUNT and i != last_led_on) else 1.0
+            brightness = _timer_arc_brightness(
+                i, TIMER_ARC_CENTER_LED, timer_ratio
             )
-            if i <= timer_ratio:
-                brightness = min(brightness_dip * (timer_ratio - i), brightness_dip)
-                self._set(i, _scale(color, brightness))
-            else:
-                self._set(i, BLACK)
+            if brightness >= 1.0 and i == self._index % LED_COUNT:
+                brightness *= 0.9
+            self._set(i, _scale(color, brightness))
 
         if muted:
             self._apply_mic_indicators()
@@ -530,7 +553,10 @@ class LEDRing:
             muted   = snap["muted"]
             volume_muted = snap["volume_muted"]
             t_total = snap["timer_total_seconds"]
-            t_left  = snap["timer_seconds_left"]
+            t_left = _remaining_timer_seconds(
+                snap["timer_seconds_left"],
+                snap["timer_updated_at"],
+            )
 
             # Volume Display takes over the ring temporarily, regardless of
             # the current pipeline state, then falls back to the normal
@@ -575,16 +601,23 @@ class LEDRing:
 # ===========================================================================
 
 def state_to_animation(
-    state: AssistState, ha_connected: bool, muted: bool
+    state: AssistState,
+    ha_connected: bool,
+    muted: bool,
+    timer_seconds_left: float = 0,
+    timer_total_seconds: int = 0,
 ) -> str:
     if not ha_connected:
         return LEDRing.ANIM_TWINKLE
 
-    if state == AssistState.NOT_READY:
-        return LEDRing.ANIM_TWINKLE
-
     if state == AssistState.TIMER_RINGING:
         return LEDRing.ANIM_TIMER_RING
+
+    if timer_seconds_left > 0 and timer_total_seconds > 0:
+        return LEDRing.ANIM_TIMER_TICK
+
+    if state == AssistState.NOT_READY:
+        return LEDRing.ANIM_TWINKLE
 
     if state == AssistState.WAKE_WORD:
         return LEDRing.ANIM_WAIT_CMD
@@ -603,9 +636,6 @@ def state_to_animation(
 
     if state == AssistState.MUTED or muted:
         return LEDRing.ANIM_MUTED
-
-    if state == AssistState.TIMER_TICKING:
-        return LEDRing.ANIM_TIMER_TICK
 
     return LEDRing.ANIM_IDLE
 
@@ -722,10 +752,19 @@ class LVAClient:
             self._state.update(assist_state=AssistState.IDLE)
 
         elif event == "muted":
-            self._state.update(assist_state=AssistState.MUTED, muted=True)
+            muted = bool(data.get("muted", True))
+            self._state.update(muted=muted)
+            if muted:
+                self._state.update(assist_state=AssistState.MUTED)
+            elif self._state.assist_state == AssistState.MUTED:
+                self._state.update(assist_state=AssistState.IDLE)
 
         elif event == "pipeline_error":
-            _LOGGER.warning("LVA pipeline error: %s", data.get("reason", ""))
+            reason = data.get("reason")
+            if reason:
+                _LOGGER.warning("LVA pipeline error: %s", reason)
+            else:
+                _LOGGER.warning("LVA pipeline error without a reason: %r", msg)
             self._state.update(assist_state=AssistState.ERROR)
 
         elif event == "disconnected":
@@ -737,15 +776,16 @@ class LVAClient:
 
         elif event == "timer_ticking":
             self._state.update(
-                assist_state=AssistState.TIMER_TICKING,
                 timer_total_seconds=data.get("total_seconds", 0),
                 timer_seconds_left=data.get("seconds_left", 0),
+                timer_updated_at=time.monotonic(),
             )
 
         elif event == "timer_updated":
             self._state.update(
                 timer_total_seconds=data.get("total_seconds", 0),
                 timer_seconds_left=data.get("seconds_left", 0),
+                timer_updated_at=time.monotonic(),
             )
 
         elif event == "timer_ringing":
@@ -753,6 +793,7 @@ class LVAClient:
                 assist_state=AssistState.TIMER_RINGING,
                 timer_total_seconds=data.get("total_seconds", 0),
                 timer_seconds_left=data.get("seconds_left", 0),
+                timer_updated_at=time.monotonic(),
             )
 
         elif event == "media_player_playing":
@@ -804,7 +845,11 @@ class LVAClient:
             # Force re-render animation with new light state
             snap = self._state.snapshot
             anim = state_to_animation(
-                snap["assist_state"], snap["ha_connected"], snap["muted"]
+                snap["assist_state"],
+                snap["ha_connected"],
+                snap["muted"],
+                snap["timer_seconds_left"],
+                snap["timer_total_seconds"],
             )
             self._leds.set_animation(anim)
             return
@@ -812,7 +857,11 @@ class LVAClient:
         # Recompute LED animation after every event
         snap = self._state.snapshot
         anim = state_to_animation(
-            snap["assist_state"], snap["ha_connected"], snap["muted"]
+            snap["assist_state"],
+            snap["ha_connected"],
+            snap["muted"],
+            snap["timer_seconds_left"],
+            snap["timer_total_seconds"],
         )
         self._leds.set_animation(anim)
 

@@ -2,7 +2,8 @@
 # ReSpeaker 4-Mic Array HAT – peripheral controller
 #
 # Runs alongside the linux-voice-assistant container.
-# Connects to LVA's peripheral WebSocket API (port 6055) and drives the
+# Connects to LVA's peripheral WebSocket API (port 6055), drives the
+# APA102 LED ring over SPI, and enables LED power through GPIO 5.
 #
 # Key differences from Satellite 1 HAT:
 #   - LEDs use SPI (not PWM/DMA), so no privileged mode is required
@@ -18,24 +19,23 @@ services:
     # -----------------------------------------------------------------------
     # Device access
     #
-    # SPI access for APA102 LEDs:
-    #   /dev/spidev0.1  – SPI0 CE1 (used by apa102-pi for the LED ring)
-    #                     Change to /dev/spidev0.0 if you wired CE0 instead.
+    # SPI access for APA102 LEDs and GPIO 5 LED-power control:
+    #   Change the SPI device and GPIO chip together with the Python constants
+    #   if using a different Raspberry Pi model or SPI chip enable.
     # -----------------------------------------------------------------------
     devices:
       - /dev/spidev0.1:/dev/spidev0.1
-      - /dev/gpiomem:/dev/gpiomem
+      - /dev/gpiochip0:/dev/gpiochip0
 
     # -----------------------------------------------------------------------
-    # Run as the gpio/spi group member — no root required.
-    # The host user must be in the gpio and spi groups.
-    # (see hardware notes below)
+    # Run without root; group_add grants access to the mapped device nodes.
+    # Update user if the Pi's service account does not use UID/GID 1000.
     # -----------------------------------------------------------------------
     user: "1000:1000"
 
     group_add:
-      - gpio
-      - spi
+      - "995"
+      - "993"
 
     # -----------------------------------------------------------------------
     # Environment
@@ -63,7 +63,7 @@ services:
     # Health check
     # -----------------------------------------------------------------------
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "respeaker4mic_peripheral.py"]
+      test: ["CMD", "pgrep", "-f", "respeaker_4mic_hat.py"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -115,16 +115,14 @@ services:
 #    Check /boot/firmware/config.txt after running install.sh before
 #    adding it manually.
 #
-# 3. GPIO GROUP (REQUIRED for button input)
+# 3. GPIO AND SPI DEVICE ACCESS (REQUIRED for LED output)
 #
-#    Add the host user to the gpio and spi groups:
+#    The container needs access to /dev/spidev0.1 and /dev/gpiochip0.
+#    group_add uses the host device group IDs; replace the values in this
+#    compose file if they differ on your Pi:
 #
-#        sudo usermod -aG gpio,spi $USER
-#
-#    Log out and back in. Also update the user field in this compose file
-#    if your UID is not 1000:
-#
-#        id -u $USER     # check your UID
+#        stat -c '%n GID=%g' /dev/spidev0.1 /dev/gpiochip0
+#        id -u $USER
 #
 # 4. SPI CONFLICT WITH seeed-voicecard
 #
@@ -134,9 +132,13 @@ services:
 # 5. SPI CE SELECTION
 #
 #    The APA102 ring does not use a chip enable (CE) line electrically, but
-#    the apa102-pi library requires CE0 or CE1 to open the SPI bus.
+#    spidev requires a device node to open the SPI bus.
 #    This compose file maps /dev/spidev0.1 (CE1). If you prefer CE0, change:
 #      - device: /dev/spidev0.0:/dev/spidev0.0
 #      - SPI_DEVICE = 0 in respeaker_4mic_hat.py
+#
+#    GPIO 5 is driven high by the controller to enable the LED power supply.
+#    On Pi 5, update /dev/gpiochip0 here and GPIO_CHIP in the Python script
+#    to /dev/gpiochip4 if that is the chip exposing the header GPIOs.
 #
 # =============================================================================

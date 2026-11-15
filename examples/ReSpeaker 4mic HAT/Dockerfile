@@ -6,21 +6,21 @@ ENV PYTHONUNBUFFERED=1
 
 LABEL \
     org.opencontainers.image.title="ReSpeaker 4-Mic Array Peripheral Controller" \
-    org.opencontainers.image.description="LED ring and button controller for ReSpeaker 4-Mic Array HAT, communicating with Linux Voice Assistant" \
+    org.opencontainers.image.description="LED ring controller for ReSpeaker 4-Mic Array HAT, communicating with Linux Voice Assistant" \
     org.opencontainers.image.source="https://github.com/OHF-Voice/linux-voice-assistant"
 
 # ----------------------------------------------------------------------------
 # System packages
 #
-#   build-essential  – compiles spidev / apa102-pi C extensions
+#   build-essential  – compiles spidev / gpiod extensions when needed
 #   python3-dev      – Python C headers
-#   git              – some pip packages pull from git during install
+#   procps           – provides pgrep for the container health check
 # ----------------------------------------------------------------------------
 RUN apt-get update && \
     apt-get install --yes --no-install-recommends \
         build-essential \
         python3-dev \
-        git \
+        procps \
         ca-certificates && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
@@ -31,10 +31,8 @@ WORKDIR /app
 # Python dependencies
 #
 #   websockets   – WebSocket client for LVA peripheral API
-#   apa102-pi    – APA102 LED ring driver (SPI)
-#   spidev       – low-level SPI access (used by apa102-pi)
-#   gpiozero     – GPIO button input (Pi 3/4/5 compatible)
-#   lgpio         – gpiozero backend; works on Pi 3/4/5 including Pi 5
+#   spidev       – direct APA102 LED ring access over SPI
+#   gpiod        – controls GPIO 5, which enables LED-ring power
 # ----------------------------------------------------------------------------
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

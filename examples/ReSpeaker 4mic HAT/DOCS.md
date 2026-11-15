@@ -36,6 +36,7 @@ The controller runs as a separate Docker container on the same Raspberry Pi. It 
 | MOSI (data) | GPIO 10 | SPI0 MOSI |
 | SCLK (clock) | GPIO 11 | SPI0 SCLK |
 | CE (bus select) | GPIO 7 (CE1) | /dev/spidev0.1 |
+| LED power enable | GPIO 5 | Driven high by the controller |
 
 ---
 
@@ -53,10 +54,12 @@ All animations mirror the Home Assistant Voice PE ESPHome firmware exactly.
 | TTS speaking                 | Anticlockwise spin          | Dual-arc spin in reverse direction                                                                |
 | Muted                        | Solid ring + red indicators | Full ring on; red at LEDs 1, 4, 7, 10 (mic corners)                                               |
 | Error                        | Red pulse                   | All LEDs red, pulsing                                                                             |
-| Timer ticking                | Countdown arc               | Arc proportional to `seconds_left / total_seconds`                                                |
+| Timer ticking                | Countdown arc               | Arc proportional to `seconds_left / total_seconds`, centered on the configured top LED            |
 | Timer ringing                | Pulse + optional red        | Full ring pulsing; red at corners if muted                                                        |
 | Volume changed               | Volume Display arc          | Temporary arc (2.5s) showing the current volume level, starting from LED 0 and sweeping clockwise |
 | Volume muted                 | Solid ring + red indicator  | Red at the bottom-mid LED                                                                         |
+
+An active timer countdown takes priority over ordinary voice-pipeline state changes, so the arc remains visible after the assistant returns to idle. The controller advances the remaining time locally between timer events. When the timer rings, the ringing animation replaces the countdown.
 
 "User color" comes from the Home Assistant Light entity described below (default: HAVPE-style blue). HA brightness scales every animation in this table. Semantic colors (Waiting/Listening cyan spin, Thinking pulse, Replying anticlockwise, Muted solid + red, Timer pulse/arc, Error red pulse) are hardcoded so they remain recognisable across user customisation.
 
@@ -123,19 +126,21 @@ ls /dev/spidev*
 # Should show: /dev/spidev0.0  /dev/spidev0.1
 ```
 
-### Step 3 — Add user to GPIO and SPI groups
+### Step 3 — Configure container access to SPI and GPIO
+
+The container uses the numeric group IDs that own the device nodes. Check them
+on the Pi and make sure `group_add` in `compose.yml` contains both IDs:
 
 ```bash
-sudo usermod -aG gpio,spi $USER
+stat -c '%n GID=%g' /dev/spidev0.1 /dev/gpiochip0
 ```
 
-Log out and back in. Check your UID:
+If the container user should match your host user, check its UID and update
+the `user:` field in `compose.yml` if it is not `1000`:
 
 ```bash
-id -u $USER
+id -u
 ```
-
-If it is not `1000`, update the `user:` field in `compose.yml` to match.
 
 > **Pi 5 note:** On Pi 5, GPIO is exposed as `/dev/gpiochip4` not `/dev/gpiochip0`. Update the `devices` mapping in `compose.yml`:
 > ```yaml
@@ -143,6 +148,7 @@ If it is not `1000`, update the `user:` field in `compose.yml` to match.
 >   - /dev/spidev0.1:/dev/spidev0.1
 >   - /dev/gpiochip4:/dev/gpiochip4
 > ```
+> Also set `GPIO_CHIP = "/dev/gpiochip4"` in `respeaker_4mic_hat.py`.
 
 ### Step 4 — File structure
 
@@ -189,6 +195,9 @@ DEFAULT_LVA_PORT = 6055
 LED_COUNT      = 12
 SPI_BUS        = 0
 SPI_DEVICE     = 1      # 1 = CE1 (/dev/spidev0.1), 0 = CE0 (/dev/spidev0.0)
+TIMER_ARC_CENTER_LED = 0 # Center LED for the countdown arc (0–11; default 0 = top)
+GPIO_CHIP      = "/dev/gpiochip0"
+LED_POWER_GPIO = 5
 LED_BRIGHTNESS = 10     # 0–31 (APA102 global brightness register)
 
 # Default ring colour (R, G, B) — matches HA Voice PE default
@@ -210,7 +219,7 @@ DEFAULT_R, DEFAULT_G, DEFAULT_B = 24, 187, 242
 | Component | Driver needed | Where to install | How |
 |---|---|---|---|
 | Microphone array (AC108) | **seeed-voicecard** | **Host Pi** | `git clone` + `sudo ./install.sh`, then reboot |
-| LED ring (APA102) | SPI overlay | **Host Pi** | `dtparam=spi=on` in `config.txt`, then reboot |
+| LED ring (APA102) | SPI + GPIO access | **Host Pi / container** | `dtparam=spi=on`; map `/dev/spidev0.1` and `/dev/gpiochip0` |
 
 ---
 
@@ -226,8 +235,9 @@ DEFAULT_R, DEFAULT_G, DEFAULT_B = 24, 187, 242
 
 1. Confirm `dtparam=spi=on` is in `/boot/firmware/config.txt` and the Pi has been rebooted.
 2. Check `/dev/spidev0.1` exists: `ls /dev/spidev*`. If only `spidev0.0` exists, change `SPI_DEVICE = 0` in the script and update the device mapping in `compose.yml` to `/dev/spidev0.0`.
-3. Confirm the container user is in the `spi` group: `groups $USER`.
-4. Run with `--debug` and look for `APA102 LED ring initialised` in the logs.
+3. Check `group_add` in `compose.yml` matches the GIDs reported for `/dev/spidev0.1` and `/dev/gpiochip0`.
+4. The controller sets GPIO 5 high to enable LED power; confirm that GPIO 5 is exposed by the mapped GPIO chip.
+5. Run with `--debug` and look for `APA102 LED ring initialised` in the logs.
 
 ### SPI and seeed-voicecard conflict
 
