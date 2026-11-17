@@ -49,9 +49,18 @@ services:
     network_mode: host
 
     # -----------------------------------------------------------------------
-    # Command-line arguments
+    # Wait until host uptime reaches 70s before registering the peripheral.
+    # This avoids LVA's first-60s late-entity reconnect cooldown after boot
+    # (https://github.com/OHF-Voice/linux-voice-assistant/issues/521).
     # -----------------------------------------------------------------------
+    entrypoint: ["/bin/sh", "-c"]
     command:
+      - |
+        while [ "$$(cut -d. -f1 /proc/uptime)" -lt 70 ]; do
+          sleep 1
+        done
+        exec python3 /app/respeaker_4mic_hat.py "$$@"
+      - respeaker4mic
       - "--host"
       - "localhost"        # Change to LVA container IP if on a different host
       - "--port"

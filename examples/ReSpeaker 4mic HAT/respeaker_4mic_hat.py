@@ -616,9 +616,6 @@ def state_to_animation(
     if timer_seconds_left > 0 and timer_total_seconds > 0:
         return LEDRing.ANIM_TIMER_TICK
 
-    if state == AssistState.NOT_READY:
-        return LEDRing.ANIM_TWINKLE
-
     if state == AssistState.WAKE_WORD:
         return LEDRing.ANIM_WAIT_CMD
 
